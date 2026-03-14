@@ -1,0 +1,7 @@
+.autoresearch-key
+results.tsv
+run.log
+*.pyc
+__pycache__/
+.venv/
+uv.lock
