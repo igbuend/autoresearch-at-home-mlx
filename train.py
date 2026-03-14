@@ -153,10 +153,10 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 6               # number of transformer layers
-N_HEAD = 6              # attention heads
-N_KV_HEAD = 6           # key/value heads (set < N_HEAD for GQA)
-N_EMBD = 192            # embedding dimension
+DEPTH = 4               # number of transformer layers
+N_HEAD = 4              # attention heads
+N_KV_HEAD = 4           # key/value heads (set < N_HEAD for GQA)
+N_EMBD = 128            # embedding dimension
 
 # Optimization
 BATCH_SIZE = 2           # smaller batch for more gradient steps
