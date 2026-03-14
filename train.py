@@ -154,12 +154,12 @@ class GPT(nn.Module):
 
 # Model architecture
 DEPTH = 2               # number of transformer layers
-N_HEAD = 3              # attention heads
-N_KV_HEAD = 3           # key/value heads (set < N_HEAD for GQA)
-N_EMBD = 96             # embedding dimension
+N_HEAD = 4              # attention heads
+N_KV_HEAD = 4           # key/value heads (set < N_HEAD for GQA)
+N_EMBD = 128            # embedding dimension
 
 # Optimization
-BATCH_SIZE = 2           # smaller batch for more gradient steps
+BATCH_SIZE = 4           # larger batch for more tokens per step and stable Muon
 MATRIX_LR = 0.032        # Muon learning rate for weight matrices
 EMBED_LR = 0.3           # Adam learning rate for embeddings
 SCALAR_LR = 0.3          # Adam learning rate for scalars (norms)
