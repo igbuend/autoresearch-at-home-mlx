@@ -42,7 +42,7 @@ MAX_CLAIM_ATTEMPTS = 5       # alternatives before giving up
 SYNC_EVERY_N = 5             # pull global best every N experiments
 
 # Apple Silicon unified memory tier boundaries (upper bounds in GB, inclusive)
-VRAM_TIERS: dict[str, int] = {
+MEMORY_TIERS: dict[str, int] = {
     "small": 8,      # ≤8 GB   (M1/M2 base)
     "medium": 16,    # ≤16 GB  (M1/M2 Pro, M3 base)
     "large": 36,     # ≤36 GB  (M1/M2 Max, M3 Pro/Max)
@@ -724,7 +724,7 @@ class Coordinator:
     def get_all_tier_bests(self) -> dict[str, Optional[dict]]:
         """Get the best result for every memory tier. Returns {tier_name: metadata_dict_or_None}."""
         tier_bests: dict[str, Optional[dict]] = {}
-        for tier_name in VRAM_TIERS:
+        for tier_name in MEMORY_TIERS:
             tier_bests[tier_name] = self.get_tier_best(tier_name)
         return tier_bests
 
@@ -1108,7 +1108,7 @@ class Coordinator:
             if has_tier_data:
                 lines.append(f"\nMemory tier bests:")
                 for tier_name, tb in tier_bests.items():
-                    bound = VRAM_TIERS[tier_name]
+                    bound = MEMORY_TIERS[tier_name]
                     label = f"≤{bound}GB" if bound else ">36GB"
                     if tb:
                         lines.append(f"  {tier_name} ({label}): val_bpb={tb.get('val_bpb', 0):.6f} by {tb.get('agent_id', '?')} — {tb.get('description', '?')}")
