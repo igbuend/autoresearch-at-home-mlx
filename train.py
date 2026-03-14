@@ -159,13 +159,16 @@ N_KV_HEAD = 6           # key/value heads (set < N_HEAD for GQA)
 N_EMBD = 192            # embedding dimension
 
 # Optimization
-BATCH_SIZE = 16          # larger batch for faster throughput
-LEARNING_RATE = 1e-3     # higher LR for small model
-WEIGHT_DECAY = 0.1       # AdamW weight decay
-WARMUP_RATIO = 0.05      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5     # fraction for LR cooldown
-FINAL_LR_FRAC = 0.1      # final LR as fraction of peak
-GRAD_ACCUM_STEPS = 1     # no accumulation needed with larger batch
+BATCH_SIZE = 2           # smaller batch for more gradient steps
+MATRIX_LR = 0.032        # Muon learning rate for weight matrices
+EMBED_LR = 0.3           # Adam learning rate for embeddings
+SCALAR_LR = 0.3          # Adam learning rate for scalars (norms)
+WEIGHT_DECAY = 0.1       # AdamW weight decay for embeddings
+MUON_MOMENTUM = 0.95     # Muon momentum
+WARMUP_RATIO = 0.0       # no warmup (Muon converges from step 0)
+WARMDOWN_RATIO = 1.0     # linear cooldown throughout training
+FINAL_LR_FRAC = 0.01     # final LR as fraction of peak
+GRAD_ACCUM_STEPS = 1
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -194,13 +197,99 @@ print(f"Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
 total_batch_tokens = BATCH_SIZE * MAX_SEQ_LEN * GRAD_ACCUM_STEPS
 print(f"Tokens per optimizer step: {total_batch_tokens:,}")
 
-# Optimizer
-optimizer = optim.AdamW(
-    learning_rate=LEARNING_RATE,
+# ---------------------------------------------------------------------------
+# Muon optimizer
+# ---------------------------------------------------------------------------
+
+def zeropower_via_newtonschulz5(G, steps=5):
+    """Newton-Schulz iteration to produce a near-orthogonal matrix from G."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.astype(mx.float32)
+    X = X / (mx.linalg.norm(X) + 1e-7)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        X = a * X + (b * A + c * (A @ A)) @ X
+    if transposed:
+        X = X.T
+    return X.astype(G.dtype)
+
+# Adam optimizer for embeddings and scalars
+adam_optimizer = optim.AdamW(
+    learning_rate=EMBED_LR,
     betas=(0.9, 0.95),
     eps=1e-8,
     weight_decay=WEIGHT_DECAY,
 )
+
+# Muon momentum state: {param_path: momentum_array}
+muon_state = {}
+
+def apply_updates(model, grads, matrix_lr, embed_lr, scalar_lr, lr_multiplier):
+    """Apply Muon to 2D weight matrices, Adam to everything else."""
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    flat_params = dict(tree_flatten(model.trainable_parameters()))
+    flat_grads = dict(tree_flatten(grads))
+
+    new_params = {}
+    adam_params = {}
+    adam_grads = {}
+
+    for k, p in flat_params.items():
+        g = flat_grads.get(k)
+        if g is None:
+            new_params[k] = p
+            continue
+
+        if p.ndim == 2 and 'wte' not in k and 'lm_head' not in k:
+            # Muon update for weight matrices
+            g_orth = zeropower_via_newtonschulz5(g)
+            prev_m = muon_state.get(k, mx.zeros_like(g_orth))
+            m = MUON_MOMENTUM * prev_m + g_orth
+            muon_state[k] = m
+            # Nesterov look-ahead
+            eff_g = MUON_MOMENTUM * m + g_orth
+            scale = math.sqrt(max(p.shape))
+            new_params[k] = p - (matrix_lr * lr_multiplier) * scale * eff_g
+        else:
+            # Adam for embeddings and scalars
+            adam_params[k] = p
+            adam_grads[k] = g
+
+    # Apply Adam to non-matrix params
+    if adam_grads:
+        # Scale embed_lr / scalar_lr (use embed_lr for simplicity)
+        adam_optimizer.learning_rate = embed_lr * lr_multiplier
+        # Temporarily update only these params via tree operations
+        # Build a sub-model update: update new_params with Adam results
+        # We'll do manual Adam here to avoid needing a sub-model
+        for k, p in adam_params.items():
+            g = adam_grads[k]
+            # Get or init Adam state
+            m_key = f"adam_m_{k}"
+            v_key = f"adam_v_{k}"
+            step_key = f"adam_step_{k}"
+            m = muon_state.get(m_key, mx.zeros_like(p))
+            v = muon_state.get(v_key, mx.zeros_like(p))
+            t = muon_state.get(step_key, 0) + 1
+            muon_state[m_key] = 0.9 * m + 0.1 * g
+            muon_state[v_key] = 0.95 * v + 0.05 * (g * g)
+            muon_state[step_key] = t
+            m_hat = muon_state[m_key] / (1 - 0.9 ** t)
+            v_hat = muon_state[v_key] / (1 - 0.95 ** t)
+            lr = (embed_lr if p.ndim >= 2 else scalar_lr) * lr_multiplier
+            update = lr * m_hat / (mx.sqrt(v_hat) + 1e-8)
+            if p.ndim >= 1:
+                update = update + lr * WEIGHT_DECAY * p
+            new_params[k] = p - update
+
+    model.update(tree_unflatten(list(new_params.items())))
+    mx.eval(model.parameters())
+    # Force eval of muon state to avoid memory buildup
+    mx.eval(*[v for v in muon_state.values() if hasattr(v, 'shape')])
 
 # Loss function
 def loss_fn(model, x, y):
@@ -265,12 +354,10 @@ while True:
 
     # Update LR schedule
     progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lr = LEARNING_RATE * get_lr_multiplier(progress)
-    optimizer.learning_rate = lr
+    lr_mult = get_lr_multiplier(progress)
 
-    # Apply gradients
-    optimizer.apply_gradients(accumulated_grads, model)
-    mx.eval(model.parameters())
+    # Apply Muon + Adam updates
+    apply_updates(model, accumulated_grads, MATRIX_LR, EMBED_LR, SCALAR_LR, lr_mult)
 
     # Fast fail
     if math.isnan(avg_loss) or avg_loss > 100:
@@ -291,7 +378,7 @@ while True:
     tok_per_sec = int(total_batch_tokens / dt)
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr:.2e} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lr: {lr_mult * MATRIX_LR:.2e} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     step += 1
 
